@@ -38,7 +38,7 @@ def create_embeddings(settings: Settings) -> HuggingFaceEndpointEmbeddings:
 
 def create_chat_model(settings: Settings) -> ChatHuggingFace:
     endpoint = HuggingFaceEndpoint(
-        repo_id=settings.chat_model,
+        model=settings.chat_model,
         task="text-generation",
         provider=settings.chat_provider,
         max_new_tokens=512,
