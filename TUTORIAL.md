@@ -17,7 +17,7 @@ Streamlit UI
    ├── 將問題轉成 embedding ──► Hugging Face Inference Provider
    │                                  │
    │                                  ▼
-   ├── 搜尋本機記憶體內的向量索引 ◄── 問題向量
+   ├── 搜尋持久化 Chroma 向量庫 ◄──── 問題向量
    │
    ├── 問題 + 檢索段落 ──► LangChain ChatHuggingFace ──► Hugging Face Provider
    │
@@ -25,9 +25,9 @@ Streamlit UI
 答案 + 後端提供的來源清單
 ```
 
-文件 embedding 和生成模型都由 Hugging Face 託管；本機只做文件解析、切塊和小型向量索引。這些操作不需要 GPU，但呼叫託管 API 需要網絡，而且可能使用額度或產生費用。Hugging Face Inference Providers 是按供應商和帳戶方案計費，請部署前查看帳戶的額度及模型價格。
+文件 embedding 和生成模型都由 Hugging Face 託管；Chroma 保存持久化向量索引。本機只在首次建立或明確重建索引時讀取文件、切塊並呼叫 embedding API；一般啟動 app 時只打開既有索引，提問時只需 embed 問題。這些操作不需要 GPU，但呼叫託管 API 需要網絡，而且可能使用額度或產生費用。Hugging Face Inference Providers 是按供應商和帳戶方案計費，請部署前查看帳戶的額度及模型價格。
 
-**第一版刻意不做：** 登入／權限、使用者任意上傳、資料庫持久化、LangGraph、多 agent、自動執行研究。先做好可重現、可測試的單一檢索問答流程。
+**第一版刻意不做：** 登入／權限、使用者任意上傳、分散式資料庫、多寫入者管理、LangGraph、多 agent、自動執行研究。Chroma 使用單機持久化儲存，適合這個小型 demo；Spaces 的持久資料放在 Storage Bucket，而不是暫存容器磁碟。
 
 ## 1. 準備工具及帳戶
 
@@ -97,7 +97,8 @@ ds-research-copilot/
 │       ├── experiment_basics.md
 │       └── model_evaluation.md
 ├── scripts/
-│   └── evaluate_retrieval.py
+│   ├── evaluate_retrieval.py
+│   └── index_documents.py
 ├── src/
 │   └── research_copilot/
 │       ├── __init__.py
@@ -105,10 +106,12 @@ ds-research-copilot/
 │       ├── config.py
 │       ├── ingestion.py
 │       └── rag.py
+├── .chroma/                     # 首次建索引後產生；不要提交到 Git
 ├── tests/
 │   ├── eval_questions.jsonl
 │   ├── test_ingestion.py
-│   └── test_rag.py
+│   ├── test_rag.py
+│   └── test_vector_store.py
 ├── .env.example
 ├── .gitignore
 ├── Dockerfile
@@ -145,6 +148,7 @@ dependencies = [
   "langchain>=1.0,<2.0",
   "langchain-huggingface>=1.0,<2.0",
   "langchain-text-splitters>=1.0,<2.0",
+  "langchain-chroma>=0.2,<2.0",
   "streamlit>=1.40,<2.0",
   "pypdf>=5.0,<7.0",
   "python-dotenv>=1.0,<2.0",
@@ -193,6 +197,7 @@ __pycache__/
 .ruff_cache/
 .env
 .streamlit/secrets.toml
+.chroma/
 *.py[cod]
 ```
 
@@ -206,6 +211,8 @@ HF_CHAT_MODEL=replace-with-supported-chat-model-id
 HF_CHAT_PROVIDER=auto
 HF_EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
 HF_EMBEDDING_PROVIDER=hf-inference
+CHROMA_PERSIST_DIRECTORY=.chroma
+CHROMA_COLLECTION_NAME=research_copilot
 ```
 
 複製成只留在本機的 `.env`，並編輯真實設定：
@@ -219,6 +226,8 @@ notepad .env
 - `HF_CHAT_MODEL`：你在 Inference Providers 清單確認可用的 chat model ID。
 - `HF_CHAT_PROVIDER`：可先用 `auto`；如自動路由不可用，改成該模型頁列出的 provider。
 - `HF_EMBEDDING_MODEL`／`HF_EMBEDDING_PROVIDER`：要支援 embedding / feature extraction 的模型與 provider。`sentence-transformers/all-mpnet-base-v2` 是 LangChain Hugging Face 文件中的例子，但實際呼叫前仍要在現行 provider 清單確認可用性。
+- `CHROMA_PERSIST_DIRECTORY`：Chroma 資料目錄；本機預設 `.chroma`，部署時改為 Space 掛載的 Storage Bucket 路徑。
+- `CHROMA_COLLECTION_NAME`：Chroma collection 名稱。保持穩定；改 embedding 模型時必須重建索引。
 
 **秘密管理規則：** `.env` 已被 `.gitignore` 忽略；只提交 `.env.example`。不要將 token 寫入 Streamlit 程式、Dockerfile、GitHub Actions YAML 或 Git。
 
@@ -266,6 +275,7 @@ Accuracy 是預測正確樣本比例；當類別不平衡時，單看 Accuracy
 ```python
 from dataclasses import dataclass
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -277,6 +287,8 @@ class Settings:
     chat_provider: str
     embedding_model: str
     embedding_provider: str
+    chroma_persist_directory: Path
+    chroma_collection_name: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -304,12 +316,21 @@ class Settings:
                 "HF_EMBEDDING_PROVIDER", "hf-inference"
             ).strip()
             or "hf-inference",
+            chroma_persist_directory=Path(
+                os.getenv("CHROMA_PERSIST_DIRECTORY", ".chroma")
+            ).expanduser(),
+            chroma_collection_name=os.getenv(
+                "CHROMA_COLLECTION_NAME", "research_copilot"
+            ).strip()
+            or "research_copilot",
         )
 ```
 
 **為甚麼集中處理設定？** 啟動時一次檢查缺少的設定，錯誤訊息會指出要修正甚麼；測試也能直接驗證設定邏輯，不需要散落在 UI 裡讀環境變數。
 
 ## 8. 建立文件解析與切塊
+
+這個步驟只會在建立或重建向量索引時執行，不會由 Streamlit app 每次啟動時呼叫。稍後新增的 `scripts/index_documents.py` 會呼叫這兩個函式一次，並將切塊及 embeddings 寫入 Chroma。
 
 在 `src/research_copilot/ingestion.py` 放入：
 
@@ -391,7 +412,7 @@ def split_documents(documents: list[Document]) -> list[Document]:
 ```python
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_chroma import Chroma
 from langchain_huggingface import (
     ChatHuggingFace,
     HuggingFaceEndpoint,
@@ -399,7 +420,6 @@ from langchain_huggingface import (
 )
 
 from research_copilot.config import Settings
-from research_copilot.ingestion import split_documents
 
 
 SYSTEM_PROMPT = """你是 Data Science Research Copilot。
@@ -440,19 +460,34 @@ def create_chat_model(settings: Settings) -> ChatHuggingFace:
     return ChatHuggingFace(llm=endpoint)
 
 
-def build_vector_store(
-    documents: list[Document],
+def create_chroma_store(
+    settings: Settings,
     embeddings: HuggingFaceEndpointEmbeddings,
-) -> InMemoryVectorStore:
-    chunks = split_documents(documents)
-    store = InMemoryVectorStore(embeddings)
-    store.add_documents(chunks)
+) -> Chroma:
+    settings.chroma_persist_directory.mkdir(parents=True, exist_ok=True)
+    return Chroma(
+        collection_name=settings.chroma_collection_name,
+        embedding_function=embeddings,
+        persist_directory=str(settings.chroma_persist_directory),
+    )
+
+
+def open_vector_store(
+    settings: Settings,
+    embeddings: HuggingFaceEndpointEmbeddings,
+) -> Chroma:
+    store = create_chroma_store(settings, embeddings)
+    if not store.get(limit=1)["ids"]:
+        raise RuntimeError(
+            "The Chroma index is empty. Build it with "
+            "`python scripts/index_documents.py` before starting the app."
+        )
     return store
 
 
 def answer_question(
     question: str,
-    vector_store: InMemoryVectorStore,
+    vector_store: Chroma,
     chat_model: ChatHuggingFace,
     k: int = 4,
 ) -> tuple[str, list[Document]]:
@@ -482,47 +517,114 @@ def answer_question(
 
 ### 這段流程做了甚麼？
 
-1. 使用 Hugging Face hosted embedding API 將文件段落轉成向量，並建立記憶體內索引。
-2. 每次提問時，將問題向量化，找出最相近的 `k` 個段落。
-3. 將問題和段落交給 LangChain chat model。
-4. 來源清單由程式根據實際 retrieval 結果產生，不依賴模型自己編造來源名稱。
+1. 一次性 indexing script 使用 Hugging Face hosted embedding API 將文件段落轉成向量，並存入 Chroma。
+2. app 啟動時只開啟既有 Chroma collection，不重新解析文件或重新 embed 文件段落。
+3. 每次提問時，只將問題向量化，找出最相近的 `k` 個段落。
+4. 將問題和段落交給 LangChain chat model。
+5. 來源清單由程式根據實際 retrieval 結果產生，不依賴模型自己編造來源名稱。
 
 **重要限制：** prompt 只能引導模型在證據不足時拒答，並不保證模型每次都遵守。此 MVP 尚未設定相似度拒答門檻，因為不同模型的分數尺度和語料分布不同；必須用自己的評估集校準後才可訂門檻。面試展示時應如實說明此限制。
 
-### 為甚麼用 `InMemoryVectorStore`？
+### 為甚麼用 Chroma 持久化向量庫？
 
-小型 demo 語料不必先維護外部向量資料庫，方便本機開發和展示。但 Space 重啟後索引會重新建立，而且文件 chunk 和向量只在執行期記憶體中。企業版本可再評估持久化向量資料庫、增量索引和文件版本管理。
+`InMemoryVectorStore` 只活在目前 Python 程序中，重啟後索引消失。Chroma 的 `persist_directory` 將 collection 寫到磁碟，重新啟動時可以重新打開，不必再次解析原始文件或向 embedding API 重新提交所有 chunks。
 
-## 10. 建立 Streamlit 使用介面
+**注意：** Chroma 仍要讀取持久化資料庫檔案，並在每條新問題上呼叫 embedding API；「不必每次 load documents」是指不再於 app 啟動時讀取原始 Markdown/PDF、切塊及重做文件 embeddings，不是完全不讀任何索引資料。換 embedding model、改切塊策略或更新文件後，必須明確重建索引。
+
+本教程以單一 Space／單一寫入者作為 demo。Storage Bucket 是可變、非版本化儲存；重建或同步索引前先停止 Space，保留本機備份，完成同步後再啟動。不要讓多個 Space replica 同時寫同一個 Chroma SQLite 資料目錄。流量或可用性要求提高時，改用 Chroma Cloud、Qdrant Cloud 等服務型資料庫。
+
+## 10. 建立一次性索引指令
+
+在 `scripts/index_documents.py` 放入：
+
+```python
+import argparse
+from pathlib import Path
+
+from research_copilot.config import Settings
+from research_copilot.ingestion import load_documents, split_documents
+from research_copilot.rag import create_chroma_store, create_embeddings
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Create or explicitly rebuild the persistent Chroma index."
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Replace the existing collection with a fresh index.",
+    )
+    args = parser.parse_args()
+
+    settings = Settings.from_env()
+    documents = load_documents(ROOT / "data" / "docs")
+    chunks = split_documents(documents)
+    embeddings = create_embeddings(settings)
+    store = create_chroma_store(settings, embeddings)
+    existing_ids = store.get(limit=1)["ids"]
+
+    if existing_ids:
+        if not args.rebuild:
+            raise RuntimeError(
+                "A Chroma index already exists. Use "
+                "`python scripts/index_documents.py --rebuild` to replace it."
+            )
+        store.delete_collection()
+        store = create_chroma_store(settings, embeddings)
+
+    store.add_documents(chunks)
+    print(
+        f"Indexed {len(documents)} source documents into {len(chunks)} chunks. "
+        f"Chroma directory: {settings.chroma_persist_directory}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+第一次建立本機索引：
+
+```powershell
+python scripts/index_documents.py
+```
+
+只有在文件、chunking 方式或 embedding model 改變時才重新建立：
+
+```powershell
+python scripts/index_documents.py --rebuild
+```
+
+這個命令會呼叫 embedding API，並替換目前 collection；請勿在 Space 正使用該索引時同步覆寫。保留 `.chroma/` 備份，再重建及部署。日常只啟動 app 或評估檢索，不會重新 embed 所有文件。
+
+**為甚麼把 indexing 分開？** 文件讀取、chunking 和 embeddings 是相對昂貴的離線準備工作；問答服務只需要查索引。把兩者分開，避免每次 app restart 或 Streamlit rerun 都重做文件 embeddings，也讓更新索引成為可控、有紀錄的操作。
+
+## 11. 建立 Streamlit 使用介面
 
 在 `src/research_copilot/app.py` 放入：
 
 ```python
-from pathlib import Path
-
 import streamlit as st
 
 from research_copilot.config import Settings
-from research_copilot.ingestion import load_documents
 from research_copilot.rag import (
     answer_question,
-    build_vector_store,
     create_chat_model,
     create_embeddings,
+    open_vector_store,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "docs"
-
-
-@st.cache_resource(show_spinner="連接模型並建立文件索引…")
+@st.cache_resource(show_spinner="連接模型和持久化向量索引…")
 def initialize(settings: Settings):
-    documents = load_documents(DATA_DIR)
     embeddings = create_embeddings(settings)
-    vector_store = build_vector_store(documents, embeddings)
+    vector_store = open_vector_store(settings, embeddings)
     chat_model = create_chat_model(settings)
-    return vector_store, chat_model, len(documents)
+    return vector_store, chat_model
 
 
 st.set_page_config(page_title="Data Science Research Copilot", page_icon="🔎")
@@ -537,10 +639,14 @@ except RuntimeError as error:
     st.error(str(error))
     st.stop()
 
-with st.spinner("首次啟動會呼叫 embedding API 建立索引…"):
-    vector_store, chat_model, document_count = initialize(settings)
+try:
+    with st.spinner("正在連接持久化 Chroma 索引…"):
+        vector_store, chat_model = initialize(settings)
+except RuntimeError as error:
+    st.error(str(error))
+    st.stop()
 
-st.caption(f"已載入 {document_count} 份文件。")
+st.caption("已連接持久化 Chroma 索引。")
 
 with st.form("question_form"):
     question = st.text_area(
@@ -581,13 +687,15 @@ streamlit run src/research_copilot/app.py
 
 瀏覽器開啟 Streamlit 顯示的網址（通常是 `http://localhost:8501`）。
 
-**為甚麼用 `st.cache_resource`？** Streamlit 每次互動都會重新執行 app script。cache 可以避免每次輸入都重新呼叫 API 建 embedding 索引，減少延遲和費用。文件更新後可在 app 右上角重新執行／清除 cache；進一步可加入明確的 index version。
+**為甚麼用 `st.cache_resource`？** Streamlit 每次互動都會重新執行 app script。cache 可避免每次輸入都重複建立 Chroma client 和 chat client。原始文件的讀取、chunking 和文件 embeddings 已移至一次性的 indexing script；清除 Streamlit cache 不會重建 Chroma index。
+
+若 app 顯示 Chroma index empty，先確認 `.chroma/` 已建立；Space 則確認 Storage Bucket 已掛載、含有 Chroma 資料，並且 `CHROMA_PERSIST_DIRECTORY` 指向正確掛載路徑。
 
 第一次啟動如果遇到認證或 provider 錯誤，先檢查 `.env`、token 權限、模型 ID、provider 支援及帳戶額度。不要把真實 token 貼到錯誤截圖或公開 issue。網絡/API 錯誤應直接修正，不應用假答案或靜默預設值掩蓋。
 
-## 11. 測試：不耗 API 的 unit tests
+## 12. 測試：不耗 API 的 unit tests
 
-CI 和日常測試不應每次都呼叫真實模型。以下測試使用本機文字文件及 fake 模型，只驗證我們寫的邏輯。
+CI 和日常測試不應每次都呼叫真實模型。以下測試使用本機文字文件、fake 模型和 fake embeddings；Chroma 持久化測試亦只在暫存目錄建立本機索引，不呼叫 Inference API。
 
 `tests/test_ingestion.py`：
 
@@ -688,6 +796,55 @@ def test_answer_handles_no_retrieved_documents() -> None:
     assert sources == []
 ```
 
+`tests/test_vector_store.py`：
+
+```python
+from pathlib import Path
+
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+
+from research_copilot.config import Settings
+from research_copilot.rag import create_chroma_store, open_vector_store
+
+
+class FakeEmbeddings(Embeddings):
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[float(len(text)), float(text.count(" "))] for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [float(len(text)), float(text.count(" "))]
+
+
+def test_chroma_index_persists_between_clients(tmp_path: Path) -> None:
+    settings = Settings(
+        hf_token="test-token",
+        chat_model="test-chat",
+        chat_provider="auto",
+        embedding_model="test-embeddings",
+        embedding_provider="hf-inference",
+        chroma_persist_directory=tmp_path / "chroma",
+        chroma_collection_name="test_collection",
+    )
+    embeddings = FakeEmbeddings()
+    first_client = create_chroma_store(settings, embeddings)
+    first_client.add_documents(
+        [
+            Document(
+                page_content="Keep the test set for final evaluation.",
+                metadata={"source": "experiment_basics.md"},
+            )
+        ]
+    )
+
+    reopened_client = open_vector_store(settings, embeddings)
+    results = reopened_client.similarity_search("final evaluation", k=1)
+
+    assert len(results) == 1
+    assert results[0].metadata["source"] == "experiment_basics.md"
+    assert "test set" in results[0].page_content
+```
+
 執行：
 
 ```powershell
@@ -696,7 +853,7 @@ python -m pytest -q
 
 **測試範圍說明：** fake 模型測試可確保 prompt 中包含檢索段落、程式會傳回來源、空問題會被拒絕；但它不能證明真實模型必定答對或準確引用。因此還需要下節的 retrieval 評估和人工檢視。
 
-## 12. 建立可量化的檢索評估集
+## 13. 建立可量化的檢索評估集
 
 在 `tests/eval_questions.jsonl` 放入一行一個 JSON 的資料：
 
@@ -716,8 +873,7 @@ import json
 from pathlib import Path
 
 from research_copilot.config import Settings
-from research_copilot.ingestion import load_documents
-from research_copilot.rag import build_vector_store, create_embeddings
+from research_copilot.rag import create_embeddings, open_vector_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -725,8 +881,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> None:
     settings = Settings.from_env()
-    documents = load_documents(ROOT / "data" / "docs")
-    store = build_vector_store(documents, create_embeddings(settings))
+    store = open_vector_store(settings, create_embeddings(settings))
 
     rows = [
         json.loads(line)
@@ -769,7 +924,7 @@ if __name__ == "__main__":
 python scripts/evaluate_retrieval.py
 ```
 
-這個 script 會呼叫 embedding API，因為要用真正選定的 embedding model 和 provider。執行前確認資料量和帳戶額度；小語料可接受，放入大量文件前應先計算成本。
+這個 script 不重新讀文件或重新 embed 文件 chunks，但每個問題仍會呼叫 embedding API 來向量化 query。執行前確認帳戶額度；小型評估集通常比重新 embed 整個 corpus 便宜得多。
 
 ### 指標如何解讀？
 
@@ -780,7 +935,7 @@ python scripts/evaluate_retrieval.py
 
 若 Recall 不理想，按以下順序調查：標註是否合理 → 文件解析是否完整 → chunk size / overlap → embedding model → `k` 值 → query 改寫。一次只改一項，重新跑相同評估集，記錄 baseline 和變更。
 
-## 13. 加入程式品質檢查及 GitHub Actions
+## 14. 加入程式品質檢查及 GitHub Actions
 
 先在本機執行：
 
@@ -839,7 +994,7 @@ git push -u origin main
 
 推送前務必用 `git status` 和 `git check-ignore .env` 確認 `.env` 沒有被加入 Git。如果 token 曾經誤上傳，即使刪除 commit 中的檔案亦可能已洩漏；應立即到 Hugging Face 撤銷並重新建立 token。
 
-## 14. 部署至 Hugging Face Spaces
+## 15. 部署至 Hugging Face Spaces
 
 ### 為甚麼用 Docker Space 跑 Streamlit？
 
@@ -856,7 +1011,6 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY src ./src
-COPY data ./data
 
 RUN python -m pip install --no-cache-dir .
 
@@ -868,7 +1022,7 @@ CMD ["streamlit", "run", "src/research_copilot/app.py", \
      "--server.headless=true"]
 ```
 
-Dockerfile 只複製 app 執行所需的程式、依賴描述及公開示範文件；沒有複製 `.env` 或本機測試快取。
+Dockerfile 只複製 app 執行所需的程式及依賴描述；原始文件不需要放進 Space image，Chroma 索引由 Storage Bucket 提供。Docker image 沒有複製 `.env` 或本機測試快取。
 
 在根目錄 `README.md` 最上方放 Spaces metadata：
 
@@ -886,6 +1040,30 @@ short_description: Evidence-oriented Q&A over public data science documents
 
 metadata 後面再加專案用途、限制和公開資料來源說明。Spaces 建置時會讀取 YAML，`sdk: docker` 指定使用 Dockerfile，`app_port: 7860` 必須與容器內 Streamlit port 一致。
 
+### 建立持久化 Storage Bucket
+
+Space 容器的普通磁碟是暫存空間，停止或重啟後可能清除。Chroma 的本機 `persist_directory` 必須放在持久化 volume，否則會再次遇到索引遺失。Hugging Face 建議用 Storage Bucket 作 Space volume；Bucket 是可變、非版本化儲存，使用前查看帳戶可用性和費用。
+
+先在本機建立索引，再上傳到 Bucket：
+
+```powershell
+python scripts/index_documents.py
+python -m pip install --upgrade huggingface_hub
+hf auth login
+hf buckets create <your-user>/ds-research-copilot-index --private
+hf buckets sync .chroma hf://buckets/<your-user>/ds-research-copilot-index --delete
+```
+
+`hf auth login` 使用可建立／寫入該 Bucket 的 token。`--delete` 令目的端和本機索引目錄一致；只在確認目標 Bucket 專供此索引使用後才使用。建立 private Bucket 可避免索引檔案公開；文件本身仍要遵守來源授權。
+
+接著在 Space 的 **Settings / Storage**（介面名稱可能更新）將此 Bucket 掛載為 volume，掛載路徑設為：
+
+```text
+/data/chroma
+```
+
+之後設定環境變數 `CHROMA_PERSIST_DIRECTORY=/data/chroma`。掛載後，app 會在該目錄開啟 Chroma 資料；不要把 `.chroma` 放回容器的普通工作目錄。
+
 ### 在 Hugging Face 建立 Space 並設定 secret
 
 1. 到 [Create a new Space](https://huggingface.co/new-space) 建立 Space，選 **Docker** SDK。
@@ -896,7 +1074,9 @@ metadata 後面再加專案用途、限制和公開資料來源說明。Spaces �
    - `HF_CHAT_PROVIDER`
    - `HF_EMBEDDING_MODEL`
    - `HF_EMBEDDING_PROVIDER`
-5. 確認 `HF_CHAT_MODEL` 和 embedding model/provider 與本機測試成功時相同。
+   - `CHROMA_PERSIST_DIRECTORY`，設為 `/data/chroma`
+   - `CHROMA_COLLECTION_NAME`，設為 `research_copilot`
+5. 確認 Space 已掛載前一步建立的 Bucket，而且 `HF_CHAT_MODEL`、embedding model/provider 與本機測試成功時相同。
 
 不要將 token 放在 README metadata、Dockerfile、Space Git history 或一般 Variable。修改 secret 後重新啟動 Space。
 
@@ -920,9 +1100,19 @@ git push space main
 
 可先在 GitHub CI 通過後再推 Space。若 Space build 或啟動失敗，查看 Space 的 **Logs**：常見原因包括 Docker build 失敗、token／provider 權限不符、模型沒有該 provider、port 未設為 `7860`、或 API 額度不足。
 
+### 更新部署中的文件索引
+
+1. 停止 Space，避免 app 同時讀取正在覆寫的 Chroma 資料。
+2. 在本機備份 `.chroma/`，更新 `data/docs/` 後執行 `python scripts/index_documents.py --rebuild`。
+3. 確認本機 app 和 retrieval 評估使用新索引正常。
+4. 執行 `hf buckets sync .chroma hf://buckets/<your-user>/ds-research-copilot-index --delete`。
+5. 重新啟動 Space，再做一次線上問答與來源驗證。
+
+如果換了 embedding model，必須完整重建索引；不能用新模型產生 query embedding 去查舊模型建立的向量。Storage Bucket 不提供 Git 式版本歷史，請保留 `.chroma/` 備份，或另外保存可重建的文件來源及評估紀錄。
+
 **免費硬件限制：** Space 的可用硬件、閒置休眠和額度會按 Hugging Face 當時政策及帳戶狀態改變。模型在雲端推理，不代表所有外部 API 免費，也不代表 UI 永遠不休眠；上線前查看 Spaces 計費及 hardware 頁面。
 
-## 15. 上線前驗收清單
+## 16. 上線前驗收清單
 
 - [ ] 本機 `.env` 被 `.gitignore` 忽略，GitHub repo 搜尋不到 token。
 - [ ] `python -m pytest -q` 通過，測試不需要 API token。
@@ -931,13 +1121,15 @@ git push space main
 - [ ] 試過語料沒有答案的問題，記錄是否正確拒答；不要假設 prompt 能百分百防止幻覺。
 - [ ] 評估集有人工標註的 expected source，已記錄 baseline Recall@1；語料擴大後再改用 Recall@5。
 - [ ] Spaces secrets 已設定；token 沒有被提交到 Git。
+- [ ] `.chroma/` 已被 `.gitignore` 忽略；Space 使用持久化 Bucket volume，而不是普通暫存磁碟。
+- [ ] Space 重啟後仍能查到 Chroma 索引；日常啟動不會重新載入原始文件或重算文件 embeddings。
 - [ ] 選定文件有可公開的授權，README 記錄來源及限制。
 - [ ] 在 README 說明：這是研究輔助工具、不能取代原始論文／專家判斷、目前無登入和私有文件保護。
 - [ ] Space 啟動後實際從公開網址完成一次問答，並檢查日誌無秘密資料。
 
 面試 demo 時，可展示一次可回答問題、一次超出語料範圍的問題，再展示 retrieval 評估、測試和 CI。討論失敗案例及下一步，比只展示一條成功回答更能證明你理解模型限制和評估。
 
-## 16. 常見問題與排查
+## 17. 常見問題與排查
 
 ### `Missing required environment variables`
 
@@ -951,9 +1143,13 @@ git push space main
 
 回到 Hub 的模型頁與 Inference Providers 清單，確認該模型確實由所選 provider 提供、chat model 支援文字生成、embedding model 支援 embeddings。必要時指定模型頁所列的 provider，不要只換一個猜測的模型名稱。
 
-### 第一次啟動很慢或花費高
+### 啟動時找不到 Chroma index
 
-啟動時需對文件 chunks 呼叫 embedding API；問題時亦需 embed query 和生成回答。先維持小語料、少量 chunk 和有限使用量，量度延遲及 provider 費用後再擴充。不要每次 rerun 都重建 index；檢查 `st.cache_resource` 是否生效。
+本機先執行 `python scripts/index_documents.py`。部署時確認 Bucket 已掛載到 `/data/chroma`、已同步 Chroma index files，而且 `CHROMA_PERSIST_DIRECTORY` 完全吻合掛載路徑。普通 Space 磁碟重啟後會清除，不能作為持久化資料目錄。
+
+### 啟動慢或 API 費用偏高
+
+正常 app 啟動不會重新讀取原始文件或重新 embed corpus；首次建立索引或 `--rebuild` 才會對所有 chunks 呼叫 embedding API。每條問題仍會 embed query 並呼叫生成模型。先維持小語料、量度延遲和費用；不要每次 rerun 都重建索引。
 
 ### PDF 沒有文字或引用頁碼不準
 
@@ -963,13 +1159,13 @@ git push space main
 
 不要即刻換更大的生成模型。先檢查是否完整解析文件、評估標籤是否正確、問題是否可從語料回答、retrieval 是否找到相關段落。RAG 的答案品質往往先受資料和檢索影響。
 
-## 17. 下一階段擴充次序
+## 18. 下一階段擴充次序
 
 只有 MVP 的測試與 baseline 穩定後，才按優先度加功能：
 
 1. **改善評估**：擴大人工評估集、記錄答對率／groundedness／拒答率、比較 chunk 和 embedding 設定。
 2. **加入更可靠的拒答策略**：使用評估資料校準 retrieval score threshold；量度誤拒答與錯誤作答的取捨。
-3. **文件管理**：上傳、去重、版本資訊、增量索引和授權欄位；若涉及企業文件，先設計身份驗證、資料隔離、保留期限和敏感資料處理。
+3. **文件管理**：上傳、去重、版本資訊、增量索引和授權欄位；若涉及企業文件，先設計身份驗證、資料隔離、保留期限和敏感資料處理。之後可由全量重建改為 per-document upsert/delete。
 4. **可觀測性**：記錄模型／provider、延遲、錯誤率、token 或費用估算；避免 log 原始機密文件內容。
 5. **LangGraph**：當流程真的需要條件分支、重試、人工審核或多階段狀態時才加入，而不是為了在簡單 RAG 上多用一個 framework。
 6. **企業部署**：私有網絡、權限與稽核、持久向量庫、rate limiting、成本預算、備援 provider、資料刪除流程。
@@ -982,7 +1178,11 @@ API 和服務會更新；執行教程前請以官方文件為準：
 
 - [LangChain：ChatHuggingFace integration](https://docs.langchain.com/oss/python/integrations/chat/huggingface)
 - [LangChain：Hugging Face embeddings integration](https://docs.langchain.com/oss/python/integrations/embeddings/huggingfacehub)
+- [LangChain：Chroma vector store integration](https://docs.langchain.com/oss/python/integrations/vectorstores/chroma)
 - [Hugging Face：Inference Providers](https://huggingface.co/docs/inference-providers/en/index)
+- [Hugging Face：Spaces storage](https://huggingface.co/docs/hub/spaces-storage)
+- [Hugging Face：Storage Buckets](https://huggingface.co/docs/hub/storage-buckets)
+- [Hugging Face：Storage Bucket access patterns and Space volume mounts](https://huggingface.co/docs/hub/storage-buckets-access)
 - [Hugging Face：Streamlit Spaces](https://huggingface.co/docs/hub/spaces-sdks-streamlit)
 - [Hugging Face：Spaces configuration reference](https://huggingface.co/docs/hub/spaces-config-reference)
 - [Hugging Face：Access tokens](https://huggingface.co/docs/hub/en/security-tokens)

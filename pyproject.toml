@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
 [project]
 name = "ai-interface-website"
 version = "0.1.0"
@@ -7,11 +11,38 @@ authors = [
     { name = "hyman9090", email = "hyman9090@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+  "langchain>=1.0,<2.0",
+  "langchain-huggingface>=1.0,<2.0",
+  "langchain-text-splitters>=1.0,<2.0",
+  "langchain-chroma>=0.2,<2.0",
+  "streamlit>=1.40,<2.0",
+  "pypdf>=5.0,<7.0",
+  "python-dotenv>=1.0,<2.0",
+]
 
 [project.scripts]
 ai-interface-website = "ai_interface_website:main"
 
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.10,<2.0",
+  "pytest>=8.0,<10.0",
+  "ruff>=0.6,<1.0",
+]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+ignore_missing_imports = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

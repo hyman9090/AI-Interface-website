@@ -1,0 +1,4 @@
+{"question":"為甚麼不應反覆根據測試集結果調整模型？","expected_sources":["experiment_basics.md"]}
+{"question":"Precision 和 Recall 分別代表甚麼？","expected_sources":["model_evaluation.md"]}
+{"question":"時間序列資料切分要注意甚麼？","expected_sources":["experiment_basics.md"]}
+{"question":"類別不平衡時，Accuracy 有甚麼限制？","expected_sources":["model_evaluation.md"]}
