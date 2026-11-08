@@ -32,6 +32,9 @@ dev = [
   "ruff>=0.6,<1.0",
 ]
 
+[tool.uv.build-backend]
+module-name = ["ai_interface_website", "research_copilot"]
+
 [tool.mypy]
 python_version = "3.14"
 mypy_path = "src"
