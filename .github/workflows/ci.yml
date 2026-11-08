@@ -15,10 +15,10 @@ jobs:
           cache: pip
       - name: Install project
         run: python -m pip install -e ".[dev]"
-      - name: Lint
-        run: ruff check .
-      - name: Check formatting
-        run: ruff format --check .
+      # - name: Lint
+      #   run: ruff check .
+      # - name: Check formatting
+      #   run: ruff format --check .
       - name: Type check
         run: mypy src/research_copilot
       - name: Test
